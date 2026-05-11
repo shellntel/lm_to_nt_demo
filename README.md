@@ -23,7 +23,6 @@ What it does, in order:
        the resulting potfile to print the final (user, password) recovery.
 
 Intentional design notes:
-- No HM1K dependencies. Everything is in this file.
-- Filters both the hex empty-LM marker (aad3b435...) AND the modern "NO PASSWORD*********************" placeholder that newer secretsdump versions emit. Without this you waste a brute-force pass on garbage.
+- Filters both the hex empty-LM marker (aad3b435...) AND the modern "NO PASSWORD*********************" placeholder that dump tools create. Without this you waste a brute-force pass on garbage.
 - Treats each unique LM half independently, so two users sharing the same first 7 password characters only contribute one half to crack.
 - Step 4 expands case permutations to a wordlist (rather than relying on hashcat's T0..TD toggle rules), so passwords containing extended ASCII work correctly.
