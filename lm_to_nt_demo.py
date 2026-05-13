@@ -17,8 +17,12 @@ What it does, in order:
     2. Tells you the hashcat mode-3000 command to run against lm_halves.txt.
        After hashcat finishes, point this script at the resulting potfile
        (or paste the lines into the prompt) so it can reassemble plaintexts.
-    3. Reassembles uppercase plaintexts by joining each user's two cracked
-       LM halves (or just half1 for ≤7-char passwords).
+    3. Reassembles uppercase plaintexts from each user's two cracked LM
+       halves. Decodes hashcat's $HEX[...] notation for non-ASCII bytes,
+       then checks half-length consistency to flag ordering edge cases.
+       When ordering can't be confirmed (rare — e.g. non-standard pwdump
+       sources, hash collisions), both p1+p2 AND p2+p1 are emitted as
+       candidate plaintexts so the NT crack covers either possibility.
     4. Writes work/case_wordlist.txt containing every case-permutation of
        every uppercase plaintext (up to 2^14 variants per password).
     5. Tells you the hashcat mode-1000 command to run against nt_hashes.txt
@@ -32,9 +36,20 @@ Intentional design notes:
       versions emit. Without this you waste a brute-force pass on garbage.
     * Treats each unique LM half independently, so two users sharing the
       same first 7 password characters only contribute one half to crack.
+      Partial cracks (one half recovered, the other not) are preserved on
+      the user record for downstream reuse analysis — hashcat's `--show`
+      against full LM hashes only emits results when both halves crack.
+    * Step 3 decodes $HEX[...] sequences in recovered plaintexts. Hashcat
+      writes non-renderable bytes that way (common for accented chars and
+      extended ASCII); without decoding, the case-permutation step would
+      generate nonsense candidates.
+    * Step 3 also runs a length-consistency check on recovered halves
+      (half1 should crack to 7 chars when password ≥8; half2 can be 1-7).
+      When the lengths don't match standard LM construction the record is
+      flagged `ordering_confirmed=False` and Step 4 emits both orderings.
     * Step 4 expands case permutations to a wordlist (rather than relying
       on hashcat's T0..TD toggle rules), so passwords containing extended
-      ASCII work correctly.
+      ASCII work correctly — toggle rules only flip ASCII a-z/A-Z.
 """
 
 from __future__ import annotations
@@ -68,6 +83,10 @@ NO_PASSWORD_PLACEHOLDER = "NO PASSWORD*********************"
 # truncated/null-padded to 14 chars before being split into two halves).
 LM_MAX_LENGTH = 14
 
+# Hashcat writes non-renderable bytes in cracked plaintexts as $HEX[<hex>].
+# Common for accented chars, extended ASCII, control codes, etc.
+HEX_PATTERN = re.compile(r"\$HEX\[([0-9a-fA-F]+)\]")
+
 
 # ---------------------------------------------------------------------------
 # Data
@@ -77,8 +96,11 @@ class UserRecord:
     """One row from the pwdump. lm_half1 / lm_half2 are the two 16-char
     halves of the LM hash. nt_hash is the 32-char NT hash."""
 
-    __slots__ = ("username", "rid", "lm_half1", "lm_half2", "nt_hash",
-                 "plain_half1", "plain_half2")
+    __slots__ = (
+        "username", "rid", "lm_half1", "lm_half2", "nt_hash",
+        "plain_half1", "plain_half2",
+        "combined_plaintext", "ordering_confirmed",
+    )
 
     def __init__(self, username: str, rid: str,
                  lm_half1: str, lm_half2: str, nt_hash: str) -> None:
@@ -89,18 +111,40 @@ class UserRecord:
         self.nt_hash = nt_hash              # 32 hex chars
         self.plain_half1: str | None = None
         self.plain_half2: str | None = None
+        self.combined_plaintext: str | None = None
+        # True when the two recovered half lengths match standard LM
+        # construction. When False, Step 4 emits both p1+p2 and p2+p1
+        # candidates to catch ordering edge cases.
+        self.ordering_confirmed: bool = False
 
-    @property
-    def uppercase_plaintext(self) -> str | None:
-        """Return the assembled uppercase plaintext if recoverable, else None."""
-        if self.plain_half1 is None:
-            return None
-        if self.lm_half2 == EMPTY_LM_HALF:
-            # Password was ≤7 chars; half1 IS the full plaintext.
-            return self.plain_half1
-        if self.plain_half2 is None:
-            return None
-        return self.plain_half1 + self.plain_half2
+
+# ---------------------------------------------------------------------------
+# $HEX[...] decoding — used during plaintext reassembly
+# ---------------------------------------------------------------------------
+
+def decode_hex_sequences(plaintext: str) -> str:
+    """Decode hashcat's $HEX[<hex>] notation back to raw bytes.
+
+    Hashcat emits non-renderable bytes in cracked passwords using this
+    notation. Without decoding, the case-permutation step would treat the
+    literal "$HEX[c3a4]" as 9 ASCII characters and produce nonsense.
+
+    Examples:
+        "TEST$HEX[0d0a]END" -> "TEST\\r\\nEND"
+        "M$HEX[c3bc]LLER"   -> "MüLLER"  (latin-1 decode of c3bc)
+
+    Uses latin-1 decoding so all 256 byte values round-trip cleanly. The
+    case-permutation logic later compares characters via str.lower()/upper()
+    which correctly handles Unicode case mapping for these bytes.
+    """
+    def _replace(match: re.Match) -> str:
+        hex_str = match.group(1)
+        try:
+            return bytes.fromhex(hex_str).decode("latin-1")
+        except (ValueError, UnicodeDecodeError):
+            # Malformed $HEX[]; leave it alone rather than crashing
+            return match.group(0)
+    return HEX_PATTERN.sub(_replace, plaintext)
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +245,7 @@ def print_lm_brute_command(lm_halves_path: Path, potfile_path: Path) -> None:
     print(f"            -1 ?u?d?s \\")
     print(f"            '?1?1?1?1?1?1?1' \\")
     print(f"            -i --increment-min 1 --increment-max 7 \\")
-    print(f"            -O -w 4 \\")
+    print(f"            -O \\")
     print(f"            --potfile-path {potfile_path} \\")
     print(f"            {lm_halves_path}")
     print()
@@ -229,69 +273,136 @@ def load_potfile(path: Path) -> dict[str, str]:
     return cracked
 
 
+def _combine_with_ordering_check(p1: str, p2: str,
+                                  half2_is_empty: bool) -> tuple[str, bool]:
+    """Concatenate two recovered LM-half plaintexts and report whether the
+    ordering is structurally consistent.
+
+    In standard LM construction:
+      - If the password is ≤7 chars, half2's hash is aad3b435b51404ee (the
+        empty marker) and only half1's plaintext is meaningful.
+      - If the password is 8-13 chars, half1's plaintext is exactly 7 chars
+        and half2's plaintext is 1-7 chars (the remainder).
+      - If the password is exactly 14 chars, both plaintexts are 7 chars.
+
+    Anything else (e.g. half1 cracking to <7 chars while half2 cracks to
+    7) implies a non-standard pwdump source, a hash collision (very rare),
+    or that the halves are in reversed byte order. The downstream wordlist
+    generator emits both orderings when ordering_confirmed is False.
+    """
+    if half2_is_empty:
+        # Password ≤7 chars: half1 IS the plaintext.
+        return p1, True
+
+    len1, len2 = len(p1), len(p2)
+    if len1 == 7 and len2 < 7:
+        # Standard 8-13 char password — confirmed.
+        return p1 + p2, True
+    if len1 == 7 and len2 == 7:
+        # Exactly 14 chars — confirmed.
+        return p1 + p2, True
+    # Unusual structure: either reversed halves or a collision. Take p1+p2
+    # as a starting point but flag it so the wordlist also tries p2+p1.
+    return p1 + p2, False
+
+
 def assemble_plaintexts(records: list[UserRecord],
-                        lm_potfile: Path) -> list[str]:
-    """Populate each record's plain_half1/plain_half2 from the LM potfile and
-    return the deduplicated list of uppercase plaintexts ready for case
-    expansion. Counts are printed for visibility."""
+                        lm_potfile: Path) -> list[tuple[str, bool]]:
+    """Populate each record's plain_half1/plain_half2 from the LM potfile,
+    decode any $HEX[...] sequences, run the ordering-confidence check, and
+    return the deduplicated list of (uppercase_plaintext, confirmed) pairs
+    ready for case expansion. Records with unconfirmed ordering AND two
+    recovered halves contribute both p1+p2 AND p2+p1 to the candidate set.
+    """
     cracked = load_potfile(lm_potfile)
     both_cracked = 0
     short_pw_cracked = 0
     one_half_only = 0
     none = 0
-    plaintexts: set[str] = set()
+    unconfirmed_orderings = 0
+    candidates: dict[str, bool] = {}  # plaintext -> confirmed
 
     for r in records:
-        r.plain_half1 = cracked.get(r.lm_half1)
-        if r.lm_half2 != EMPTY_LM_HALF:
-            r.plain_half2 = cracked.get(r.lm_half2)
+        # Apply $HEX[] decoding to whatever hashcat reported, so the rest of
+        # the pipeline operates on real characters.
+        raw1 = cracked.get(r.lm_half1)
+        raw2 = cracked.get(r.lm_half2) if r.lm_half2 != EMPTY_LM_HALF else None
+        if raw1 is not None:
+            r.plain_half1 = decode_hex_sequences(raw1)
+        if raw2 is not None:
+            r.plain_half2 = decode_hex_sequences(raw2)
 
-        pt = r.uppercase_plaintext
-        if pt is not None:
-            plaintexts.add(pt)
-            if r.lm_half2 == EMPTY_LM_HALF:
-                short_pw_cracked += 1
-            else:
-                both_cracked += 1
-        else:
-            # Diagnose why this user isn't recoverable.
-            if r.plain_half1 is not None or r.plain_half2 is not None:
+        if r.plain_half1 is None:
+            # First half didn't crack. Even if half2 did, we can't assemble
+            # the full plaintext without it.
+            if r.plain_half2 is not None:
                 one_half_only += 1
             else:
                 none += 1
+            continue
+
+        if r.lm_half2 == EMPTY_LM_HALF:
+            r.combined_plaintext, r.ordering_confirmed = (
+                _combine_with_ordering_check(r.plain_half1, "", True)
+            )
+            short_pw_cracked += 1
+            candidates.setdefault(r.combined_plaintext, r.ordering_confirmed)
+            continue
+
+        if r.plain_half2 is None:
+            one_half_only += 1
+            continue
+
+        r.combined_plaintext, r.ordering_confirmed = (
+            _combine_with_ordering_check(r.plain_half1, r.plain_half2, False)
+        )
+        both_cracked += 1
+        if not r.ordering_confirmed:
+            unconfirmed_orderings += 1
+
+        # Always include the standard ordering.
+        candidates.setdefault(r.combined_plaintext, r.ordering_confirmed)
+        # When ordering can't be confirmed, also try the reverse so the NT
+        # crack covers either possibility.
+        if not r.ordering_confirmed:
+            reversed_plaintext = r.plain_half2 + r.plain_half1
+            candidates.setdefault(reversed_plaintext, False)
 
     print(f"[3/5] Reassembly results:")
     print(f"        {both_cracked} users with both LM halves cracked (8-14 char passwords)")
     print(f"        {short_pw_cracked} users with ≤7 char passwords (half1 only)")
     print(f"        {one_half_only} users with only one half cracked (not recoverable)")
     print(f"        {none} users with neither half cracked (not recoverable)")
-    print(f"[3/5] Unique uppercase plaintexts ready for case expansion: "
-          f"{len(plaintexts)}")
-    return sorted(plaintexts)
+    if unconfirmed_orderings:
+        print(f"        {unconfirmed_orderings} users with non-standard half-length combinations "
+              f"(both orderings will be tried)")
+    print(f"[3/5] Unique uppercase plaintext candidates: {len(candidates)}")
+    # Stable, sorted ordering keeps the wordlist deterministic between runs.
+    return sorted(candidates.items())
 
 
 # ---------------------------------------------------------------------------
 # Step 4 — Generate the case-permutation wordlist
 # ---------------------------------------------------------------------------
 
-def write_case_wordlist(plaintexts: list[str], out_path: Path) -> int:
-    """For each plaintext, emit every case variant (2^len). Returns the
-    total line count.
+def write_case_wordlist(candidates: list[tuple[str, bool]],
+                         out_path: Path) -> int:
+    """For each candidate plaintext, emit every case variant (2^letters).
+    Returns the total line count.
 
-    Implementation: iterate every bitmask 0..2^len-1; for each bit set,
-    lowercase the corresponding character. The original uppercase string
-    is included (bitmask == 0)."""
+    Implementation: itertools.product over (lower, upper) for each letter
+    position. Non-letter characters (digits, symbols, non-letter Unicode)
+    collapse to a single option so the variant count stays at 2^letter_count
+    rather than 2^len for all-digit passwords. Output uses latin-1 so the
+    full byte range round-trips intact.
+    """
     total = 0
-    written: set[str] = set()  # de-dupe across plaintexts (e.g. all-digit pws)
+    written: set[str] = set()  # dedupe across all candidate plaintexts
 
-    with out_path.open("w", encoding="utf-8") as f:
-        for pt in plaintexts:
-            n = min(len(pt), LM_MAX_LENGTH)
-            # Build a list of (lower, upper) per character. Non-letters
-            # collapse to a single option so the variant count stays at
-            # 2^(letter_count) rather than 2^len for all-digit passwords.
+    with out_path.open("w", encoding="latin-1", errors="replace") as f:
+        for plaintext, _confirmed in candidates:
             per_char_variants = []
-            for ch in pt:
+            for ch in plaintext:
                 lower = ch.lower()
                 upper = ch.upper()
                 if lower == upper:
@@ -319,7 +430,7 @@ def print_nt_crack_command(nt_hashes_path: Path, wordlist_path: Path,
     print()
     print("[5/5] Run the NT crack step yourself:")
     print()
-    print(f"    hashcat -m 1000 -a 0 -O -w 4 \\")
+    print(f"    hashcat -m 1000 -a 0 -O \\")
     print(f"            --potfile-path {potfile_path} \\")
     print(f"            {nt_hashes_path} {wordlist_path}")
     print()
@@ -396,13 +507,13 @@ def main() -> int:
                   f"Run the mode-3000 command from the 'prepare' stage first.",
                   file=sys.stderr)
             return 3
-        plaintexts = assemble_plaintexts(records, lm_potfile)
-        if not plaintexts:
+        candidates = assemble_plaintexts(records, lm_potfile)
+        if not candidates:
             print("No uppercase plaintexts assembled — nothing to feed into "
                   "the NT crack. Are the right LM halves in the potfile?",
                   file=sys.stderr)
             return 4
-        write_case_wordlist(plaintexts, case_wordlist_path)
+        write_case_wordlist(candidates, case_wordlist_path)
         print_nt_crack_command(nt_hashes_path, case_wordlist_path, nt_potfile)
         if args.stage == "assemble":
             return 0
